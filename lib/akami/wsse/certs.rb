@@ -9,7 +9,9 @@ module Akami
         end
       end
 
-      attr_accessor :cert_file, :cert_string, :private_key_file, :private_key_string, :private_key_password
+      attr_accessor :cert_file, :cert_string, :private_key_file,
+                    :private_key_string, :private_key_password,
+                    :cert, :private_key
 
       # Returns an <tt>OpenSSL::X509::Certificate</tt> for the +cert_string+ or +cert_file+.
       def cert

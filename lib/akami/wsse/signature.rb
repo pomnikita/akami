@@ -22,17 +22,42 @@ module Akami
         @document = Nokogiri::XML(document)
       end
 
+      DIGESTERS = {
+        # SHA1
+        sha1: {
+          algorithm: 'http://www.w3.org/2000/09/xmldsig#sha1',
+          algorithm2: 'http://www.w3.org/2000/09/xmldsig#sha1',
+          digester: lambda { OpenSSL::Digest::SHA1.new }
+        },
+        # SHA 256
+        sha256: {
+          algorithm: 'http://www.w3.org/2001/04/xmldsig-more#rsa-sha256',
+          algorithm2: 'http://www.w3.org/2001/04/xmldsig-more#rsa-sha256',
+          digester: lambda { OpenSSL::Digest::SHA256.new }
+        },
+        # GOST R 34-11 94
+        gost3411: {
+          algorithm: 'http://www.w3.org/2001/04/xmldsig-more#gostr3411',
+          algorithm2: 'http://www.w3.org/2001/04/xmldsig-more#gostr34102001-gostr3411',
+          digester: lambda {
+            engine = OpenSSL::Engine.by_id('gost')
+            engine.set_default(0xFFFF)
+            engine.digest('md_gost94')
+          }
+        }
+      }
+
       ExclusiveXMLCanonicalizationAlgorithm = 'http://www.w3.org/2001/10/xml-exc-c14n#'.freeze
-      RSASHA1SignatureAlgorithm = 'http://www.w3.org/2000/09/xmldsig#rsa-sha1'.freeze
-      SHA1DigestAlgorithm = 'http://www.w3.org/2000/09/xmldsig#sha1'.freeze
 
       X509v3ValueType = 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3'.freeze
       Base64EncodingType = 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary'.freeze
 
       SignatureNamespace = 'http://www.w3.org/2000/09/xmldsig#'.freeze
 
-      def initialize(certs = Certs.new)
+      def initialize(certs = Certs.new, digest_algorithm = :sha256)
         @certs = certs
+        @digest_info = DIGESTERS[digest_algorithm].clone
+        @digest_info[:digester] = @digest_info[:digester].call
       end
 
       def have_document?
@@ -65,21 +90,22 @@ module Akami
 
         sig = signed_info.merge(key_info).merge(signature_value)
         sig.merge! :order! => []
-        [ "SignedInfo", "SignatureValue", "KeyInfo" ].each do |key|
+        [ "ds:SignedInfo", "ds:SignatureValue", "ds:KeyInfo" ].each do |key|
           sig[:order!] << key if sig[key]
         end
 
         token = {
-          "Signature" => sig,
-          :attributes! => { "Signature" => { "xmlns" => SignatureNamespace } },
+          "ds:Signature" => sig,
+          :attributes! => { "ds:Signature" => { "xmlns:ds" => SignatureNamespace } },
         }
 
-        token.deep_merge!(binary_security_token) if certs.cert
-
+        # token.deep_merge!(binary_security_token) if certs.cert
         token.merge! :order! => []
-        [ "wsse:BinarySecurityToken", "Signature" ].each do |key|
+        [ "wsse:BinarySecurityToken", "ds:Signature" ].each do |key|
           token[:order!] << key if token[key]
         end
+
+        token[:order!] << 'wsse:UsernameToken'
 
         token
       end
@@ -100,40 +126,44 @@ module Akami
 
       def key_info
         {
-          "KeyInfo" => {
+          "ds:KeyInfo" => {
             "wsse:SecurityTokenReference" => {
-              "wsse:Reference/" => nil,
-              :attributes! => { "wsse:Reference/" => {
-                "ValueType" => X509v3ValueType,
-                "URI" => "##{security_token_id}",
-              } }
-            },
-            :attributes! => { "wsse:SecurityTokenReference" => { "xmlns:wsu" => "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd" } },
-          },
+              "ds:X509Data" => {
+                "ds:X509IssuerSerial" => {
+                  "ds:X509IssuerName" => certs.cert.issuer.to_s.gsub(/^\//, '').gsub(/\//, ','),
+                  "ds:X509SerialNumber" => certs.cert.serial.to_s
+                }
+              }
+            }
+          }
         }
       end
 
       def signature_value
-        { "SignatureValue" => the_signature }
+        { "ds:SignatureValue" => the_signature }
       rescue MissingCertificate
         {}
       end
 
       def signed_info
         {
-          "SignedInfo" => {
-            "CanonicalizationMethod/" => nil,
-            "SignatureMethod/" => nil,
-            "Reference" => [
-              #signed_info_transforms.merge(signed_info_digest_method).merge({ "DigestValue" => timestamp_digest }),
+          "ds:SignedInfo" => {
+            "ds:CanonicalizationMethod" => {
+              "ec:InclusiveNamespaces/" => nil,
+              :attributes! => {
+                "ec:InclusiveNamespaces/" => { "xmlns:ec" => "http://www.w3.org/2001/10/xml-exc-c14n#", "PrefixList" => "soap"}
+              }
+            },
+            "ds:SignatureMethod/" => nil,
+            "ds:Reference" => [
               signed_info_transforms.merge(signed_info_digest_method).merge({ "DigestValue" => body_digest }),
             ],
             :attributes! => {
-              "CanonicalizationMethod/" => { "Algorithm" => ExclusiveXMLCanonicalizationAlgorithm },
-              "SignatureMethod/" => { "Algorithm" => RSASHA1SignatureAlgorithm },
-              "Reference" => { "URI" => ["##{body_id}"] },
+              "ds:CanonicalizationMethod/" => { "Algorithm" => ExclusiveXMLCanonicalizationAlgorithm },
+              "ds:SignatureMethod/" => { "Algorithm" => @digest_info[:algorithm2] },
+              "ds:Reference" => { "URI" => ["##{body_id}"] },
             },
-            :order! => [ "CanonicalizationMethod/", "SignatureMethod/", "Reference" ],
+            :order! => [ "ds:CanonicalizationMethod", "ds:SignatureMethod/", "ds:Reference" ],
           },
         }
       end
@@ -142,21 +172,34 @@ module Akami
         raise MissingCertificate, "Expected a private_key for signing" unless certs.private_key
         signed_info = at_xpath(@document, "//Envelope/Header/Security/Signature/SignedInfo")
         signed_info = signed_info ? canonicalize(signed_info) : ""
-        signature = certs.private_key.sign(OpenSSL::Digest::SHA1.new, signed_info)
+        signature = certs.private_key.sign(@digest_info[:digester], signed_info)
         Base64.encode64(signature).gsub("\n", '') # TODO: DRY calls to Base64.encode64(...).gsub("\n", '')
       end
 
       def body_digest
         body = canonicalize(at_xpath(@document, "//Envelope/Body"))
-        Base64.encode64(OpenSSL::Digest::SHA1.digest(body)).strip
+        Base64.encode64(@digest_info[:digester].digest(body)).strip
       end
 
       def signed_info_digest_method
-        { "DigestMethod/" => nil, :attributes! => { "DigestMethod/" => { "Algorithm" => SHA1DigestAlgorithm } } }
+        {
+          "DigestMethod/" => nil,
+          :attributes! => { "DigestMethod/" => { "Algorithm" => @digest_info[:algorithm] } }
+        }
       end
 
       def signed_info_transforms
-        { "Transforms" => { "Transform/" => nil, :attributes! => { "Transform/" => { "Algorithm" => ExclusiveXMLCanonicalizationAlgorithm } } } }
+        {
+          "ds:Transforms" => {
+            "ds:Transform" => {
+              "ec:InclusiveNamespaces/" => nil,
+              :attributes! => {
+                "ec:InclusiveNamespaces/" => { "xmlns:ec" => "http://www.w3.org/2001/10/xml-exc-c14n#", "PrefixList" =>"" }
+              }
+            },
+            :attributes! => { "ds:Transform" => { "Algorithm" => ExclusiveXMLCanonicalizationAlgorithm } }
+          }
+        }
       end
 
       def uid

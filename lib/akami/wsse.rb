@@ -46,9 +46,29 @@ module Akami
       self.username = username
       self.password = password
       self.digest = digest
+
+      credentials_hash = if username_token? && timestamp?
+        sse_username_token.merge!(wsu_timestamp) {
+          |key, v1, v2| v1.merge!(v2) {
+            |key, v1, v2| v1.merge!(v2)
+          }
+        }
+      elsif username_token?
+        wsse_username_token
+      elsif timestamp?
+        wsu_timestamp
+      else
+        {}
+      end
+      hash.deep_merge! credentials_hash
     end
 
     attr_accessor :username, :password, :created_at, :expires_at, :signature, :verify_response
+
+    def signature=(signature)
+      @signature = signature
+      hash.deep_merge!(wsse_signature) if signature? and signature.have_document?
+    end
 
     def sign_with=(klass)
       @signature = klass
@@ -91,21 +111,7 @@ module Akami
 
     # Returns the XML for a WSSE header.
     def to_xml
-      if signature? and signature.have_document?
-        Gyoku.xml wsse_signature.merge!(hash)
-      elsif username_token? && timestamp?
-        Gyoku.xml wsse_username_token.merge!(wsu_timestamp) {
-          |key, v1, v2| v1.merge!(v2) {
-            |key, v1, v2| v1.merge!(v2)
-          }
-        }
-      elsif username_token?
-        Gyoku.xml wsse_username_token.merge!(hash)
-      elsif timestamp?
-        Gyoku.xml wsu_timestamp.merge!(hash)
-      else
-        ""
-      end
+      Gyoku.xml hash
     end
 
   private
